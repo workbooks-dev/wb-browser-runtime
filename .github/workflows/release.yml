@@ -40,9 +40,10 @@ jobs:
             exit 1
           fi
 
+      # Auth is via npm trusted publishing (OIDC). No NPM_TOKEN needed —
+      # `id-token: write` above + the GitHub/workflow trust configured in
+      # the npm package's "Trusted Publishers" settings is sufficient.
       - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   github-release:
     needs: publish
