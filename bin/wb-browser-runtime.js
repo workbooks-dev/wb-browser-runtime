@@ -34,6 +34,11 @@ import {
   loadRecordingConfig,
 } from "../lib/recording-manager.js";
 import { getProvider } from "../lib/providers/index.js";
+import {
+  attachConsoleBuffer,
+  captureFailureDiagnostics,
+  classifyError,
+} from "../lib/failure.js";
 import { SUPPORTS, runVerb, verbName } from "../verbs/index.js";
 
 const VERSION = "0.8.0";
@@ -89,6 +94,7 @@ async function ensureSession(name, { profile, restoreSession } = {}) {
       const tConnected = Date.now();
       const context = browser.contexts()[0] ?? (await browser.newContext());
       const page = context.pages()[0] ?? (await context.newPage());
+      const consoleBuffer = attachConsoleBuffer(page);
       const tPageReady = Date.now();
 
       const info = {
@@ -100,6 +106,7 @@ async function ensureSession(name, { profile, restoreSession } = {}) {
         page,
         liveUrl,
         recording: null,
+        consoleBuffer,
       };
 
       send({
@@ -277,6 +284,7 @@ async function handleSlice(msg) {
     } catch (e) {
       send({
         type: "slice.failed",
+        code: classifyError(e, "session"),
         error: `session start failed: ${scrubSecrets(e.message, sliceCtx.secrets)}`,
       });
       return;
@@ -298,6 +306,7 @@ async function handleSlice(msg) {
       if (Date.now() >= sliceDeadline) {
         send({
           type: "slice.failed",
+          code: "SLICE_TIMEOUT",
           error: `slice exceeded deadline (${sliceDeadlineMs}ms); aborted before verb index ${i} of ${verbs.length}`,
         });
         return;
@@ -353,15 +362,28 @@ async function handleSlice(msg) {
       } catch (e) {
         const duration_ms = Date.now() - verbStart;
         const clean = scrubSecrets(e.message, sliceCtx.secrets);
+        const code = classifyError(e, name);
+        const diagnostics = await captureFailureDiagnostics({
+          page: session.page,
+          artifactsDir: (process.env.WB_ARTIFACTS_DIR || "").trim() || null,
+          verbIndex: i,
+          consoleBuffer: session.consoleBuffer,
+          scrubSecrets,
+          secrets: sliceCtx.secrets,
+        });
         send({
           type: "verb.failed",
           verb: name,
           verb_index: i,
+          code,
           error: clean,
           duration_ms,
+          screenshot_path: diagnostics.screenshot_path,
+          console_tail: diagnostics.console_tail,
         });
         send({
           type: "slice.failed",
+          code,
           error: `verb ${name} (index ${i}): ${clean}`,
         });
         return;
@@ -373,6 +395,7 @@ async function handleSlice(msg) {
     try {
       send({
         type: "slice.failed",
+        code: classifyError(e, "sidecar"),
         error: `sidecar error: ${scrubSecrets(e.message, sliceCtx.secrets)}`,
       });
     } catch {}

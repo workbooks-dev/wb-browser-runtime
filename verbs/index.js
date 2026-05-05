@@ -13,6 +13,7 @@ import fillVerb from "./fill.js";
 import clickVerb from "./click.js";
 import pressVerb from "./press.js";
 import waitForVerb from "./wait_for.js";
+import waitForNetworkIdleVerb from "./wait_for_network_idle.js";
 import screenshotVerb from "./screenshot.js";
 import extractVerb from "./extract.js";
 import assertVerb from "./assert.js";
@@ -28,6 +29,7 @@ const VERBS = [
   clickVerb,
   pressVerb,
   waitForVerb,
+  waitForNetworkIdleVerb,
   screenshotVerb,
   extractVerb,
   assertVerb,

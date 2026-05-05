@@ -22,13 +22,14 @@ import { createStubPage, captureSendFrames } from "../lib/stub-page.js";
 
 // --- registry shape ---------------------------------------------------------
 
-test("SUPPORTS lists all 13 verbs in expected order", () => {
+test("SUPPORTS lists all 14 verbs in expected order", () => {
   assert.deepEqual(SUPPORTS, [
     "goto",
     "fill",
     "click",
     "press",
     "wait_for",
+    "wait_for_network_idle",
     "screenshot",
     "extract",
     "assert",
@@ -139,6 +140,136 @@ test("click clicks selector with default timeout", async () => {
   assert.equal(page.calls[0].verb, "click");
   assert.equal(page.calls[0].options.timeout, 10_000);
   assert.equal(summary, ".btn");
+});
+
+test("click falls back to text when selector times out", async () => {
+  const calls = [];
+  const timeoutErr = Object.assign(new Error("timeout: #submit"), {
+    name: "TimeoutError",
+  });
+  const page = {
+    calls,
+    async click(selector) {
+      calls.push({ verb: "click", selector });
+      throw timeoutErr;
+    },
+    getByText(text, options) {
+      calls.push({ verb: "getByText", text, options });
+      return {
+        first() {
+          return {
+            async click(opts) {
+              calls.push({ verb: "fallback.click", opts });
+            },
+          };
+        },
+      };
+    },
+  };
+  const summary = await VERB_REGISTRY.click.execute(page, {
+    selector: "#submit",
+    text_fallback: "Send",
+  });
+  assert.equal(calls[0].verb, "click");
+  assert.equal(calls[1].verb, "getByText");
+  assert.equal(calls[1].text, "Send");
+  assert.equal(calls[1].options.exact, false);
+  assert.equal(calls[2].verb, "fallback.click");
+  assert.equal(summary, '#submit (via text="Send")');
+});
+
+test("click re-throws ORIGINAL error when text fallback also fails", async () => {
+  const original = Object.assign(new Error("orig: #x not found"), {
+    name: "TimeoutError",
+  });
+  const fallbackErr = new Error("fallback: text not visible");
+  const page = {
+    async click() {
+      throw original;
+    },
+    getByText() {
+      return {
+        first() {
+          return {
+            async click() {
+              throw fallbackErr;
+            },
+          };
+        },
+      };
+    },
+  };
+  await assert.rejects(
+    VERB_REGISTRY.click.execute(page, {
+      selector: "#x",
+      text_fallback: "Go",
+    }),
+    (err) => err === original,
+  );
+});
+
+test("click re-throws non-TimeoutError without trying fallback", async () => {
+  const oddErr = Object.assign(new Error("network down"), {
+    name: "NetworkError",
+  });
+  let fallbackCalled = false;
+  const page = {
+    async click() {
+      throw oddErr;
+    },
+    getByText() {
+      fallbackCalled = true;
+      return { first: () => ({ click: async () => {} }) };
+    },
+  };
+  await assert.rejects(
+    VERB_REGISTRY.click.execute(page, {
+      selector: "#x",
+      text_fallback: "Go",
+    }),
+    (err) => err === oddErr,
+  );
+  assert.equal(fallbackCalled, false);
+});
+
+// --- wait_for_network_idle --------------------------------------------------
+
+test("wait_for_network_idle waits with default 30s timeout", async () => {
+  const page = createStubPage();
+  const summary = await VERB_REGISTRY.wait_for_network_idle.execute(page, {});
+  assert.equal(page.calls[0].verb, "waitForLoadState");
+  assert.equal(page.calls[0].state, "networkidle");
+  assert.equal(page.calls[0].options.timeout, 30_000);
+  assert.equal(summary, "network idle (timeout=30000ms)");
+});
+
+test("wait_for_network_idle accepts duration string", async () => {
+  const page = createStubPage();
+  const summary = await VERB_REGISTRY.wait_for_network_idle.execute(page, {
+    timeout: "45s",
+  });
+  assert.equal(page.calls[0].options.timeout, 45_000);
+  assert.equal(summary, "network idle (timeout=45s)");
+});
+
+test("wait_for_network_idle accepts numeric ms", async () => {
+  const page = createStubPage();
+  await VERB_REGISTRY.wait_for_network_idle.execute(page, { timeout: 7500 });
+  assert.equal(page.calls[0].options.timeout, 7500);
+});
+
+test("wait_for_network_idle parses 2m / 500ms / 1h", async () => {
+  const page = createStubPage();
+  await VERB_REGISTRY.wait_for_network_idle.execute(page, { timeout: "2m" });
+  assert.equal(page.calls[0].options.timeout, 120_000);
+
+  const p2 = createStubPage();
+  await VERB_REGISTRY.wait_for_network_idle.execute(p2, { timeout: "500ms" });
+  assert.equal(p2.calls[0].options.timeout, 500);
+
+  const p3 = createStubPage();
+  await VERB_REGISTRY.wait_for_network_idle.execute(p3, { timeout: "1h" });
+  assert.equal(p3.calls[0].options.timeout, 3_600_000);
 });
 
 // --- press ------------------------------------------------------------------
