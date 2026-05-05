@@ -56,7 +56,7 @@ if (recording.enabled) {
 
 const sessions = new SessionManager();
 
-async function ensureSession(name, { profile } = {}) {
+async function ensureSession(name, { profile, restoreSession } = {}) {
   return sessions.ensure(name, async () => {
     // Vendors charge for the session the moment allocate() returns; if
     // anything after this point throws (getLiveUrl, CDP connect, newContext,
@@ -69,11 +69,22 @@ async function ensureSession(name, { profile } = {}) {
     // against a cold vendor region, but the live-URL fetch and
     // newContext/newPage can each stall independently.
     const t0 = Date.now();
-    const allocated = await provider.allocate({ profile, sessionName: name });
+    const restored =
+      restoreSession &&
+      restoreSession.vendor === provider.name &&
+      restoreSession.cdpUrl;
+    const allocated = restored
+      ? {
+          sid: restoreSession.sid,
+          cdpUrl: restoreSession.cdpUrl,
+          _liveUrl: restoreSession.liveUrl ?? null,
+          _restored: true,
+        }
+      : await provider.allocate({ profile, sessionName: name });
     const tAllocated = Date.now();
     let browser = null;
     try {
-      const liveUrl = await provider.getLiveUrl(allocated);
+      const liveUrl = allocated._liveUrl ?? (await provider.getLiveUrl(allocated));
       browser = await chromium.connectOverCDP(allocated.cdpUrl);
       const tConnected = Date.now();
       const context = browser.contexts()[0] ?? (await browser.newContext());
@@ -82,6 +93,8 @@ async function ensureSession(name, { profile } = {}) {
 
       const info = {
         sid: allocated.sid,
+        cdpUrl: allocated.cdpUrl,
+        vendor: provider.name,
         browser,
         context,
         page,
@@ -95,6 +108,7 @@ async function ensureSession(name, { profile } = {}) {
         session_id: allocated.sid,
         live_url: liveUrl,
         vendor: provider.name,
+        restored: Boolean(restored),
         started_at: new Date().toISOString(),
         timings: {
           allocate_ms: tAllocated - t0,
@@ -107,12 +121,12 @@ async function ensureSession(name, { profile } = {}) {
       await recording.start(info, name);
       return info;
     } catch (e) {
-      if (browser) {
+      if (browser && !allocated._restored) {
         try {
           await browser.close();
         } catch {}
       }
-      await provider.release(allocated.sid);
+      if (!allocated._restored) await provider.release(allocated.sid);
       throw e;
     }
   });
@@ -252,10 +266,14 @@ async function handleSlice(msg) {
     const verbs = Array.isArray(msg.verbs) ? msg.verbs : [];
     const sessionName = msg.session || "default";
     const restore = msg.restore || null;
+    const restoreSession = restore?.state?.session || null;
 
     let session;
     try {
-      session = await ensureSession(sessionName, { profile: msg.profile });
+      session = await ensureSession(sessionName, {
+        profile: msg.profile,
+        restoreSession,
+      });
     } catch (e) {
       send({
         type: "slice.failed",
@@ -311,7 +329,17 @@ async function handleSlice(msg) {
             // descriptor and handed back on resume. The verb can stash
             // whatever it needs here; we always ensure verb_index is set
             // so the dispatcher can compute startAt on re-entry.
-            sidecar_state: { ...(pauseMeta.sidecar_state || {}), verb_index: i },
+            sidecar_state: {
+              ...(pauseMeta.sidecar_state || {}),
+              verb_index: i,
+              session: {
+                vendor: session.vendor,
+                name: sessionName,
+                sid: session.sid,
+                cdpUrl: session.cdpUrl,
+                liveUrl: session.liveUrl,
+              },
+            },
           });
           return;
         }
@@ -391,6 +419,32 @@ async function shutdown() {
   process.exit(0);
 }
 
+async function suspend() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // Flush recordings while CDP is still connected, but intentionally leave
+  // browser contexts and vendor sessions open. The operator needs the live
+  // inspector after wb exits 42, and wb resume reconnects using the persisted
+  // cdpUrl/liveUrl in sidecar_state.
+  for (const [name, info] of sessions) {
+    try {
+      await recording.flush(info, name);
+    } catch (e) {
+      log(`[suspend] flush recording ${name}: ${e.message}`);
+      try {
+        send({
+          type: "slice.recording.failed",
+          session: name,
+          run_id: recording.runId,
+          reason: `suspend_finalize_error: ${e.message}`,
+        });
+      } catch {}
+    }
+  }
+  log("[suspend] leaving browser session alive for external resume");
+  process.exit(0);
+}
+
 // --- Main loop --------------------------------------------------------------
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
@@ -426,6 +480,15 @@ async function drainAndShutdown() {
   await shutdown();
 }
 
+async function drainAndSuspend() {
+  try {
+    await sessions.drainAll();
+  } catch (e) {
+    log(`[suspend] drain failed: ${e.message}`);
+  }
+  await suspend();
+}
+
 rl.on("line", (line) => {
   const trimmed = line.trim();
   if (!trimmed) return;
@@ -452,6 +515,9 @@ rl.on("line", (line) => {
       break;
     case "shutdown":
       drainAndShutdown();
+      break;
+    case "suspend":
+      drainAndSuspend();
       break;
     default:
       log(`[warn] unknown message type: ${msg.type}`);
