@@ -90,7 +90,13 @@ async function ensureSession(name, { profile, restoreSession } = {}) {
     let browser = null;
     try {
       const liveUrl = allocated._liveUrl ?? (await provider.getLiveUrl(allocated));
-      browser = await chromium.connectOverCDP(allocated.cdpUrl);
+      // Local provider returns a pre-built Browser via `_browser` (no CDP
+      // round-trip — chromium is already launched in-process). Cloud
+      // providers return a `cdpUrl` we connect to. Restored sessions
+      // always reconnect via CDP.
+      browser =
+        allocated._browser ??
+        (await chromium.connectOverCDP(allocated.cdpUrl));
       const tConnected = Date.now();
       const context = browser.contexts()[0] ?? (await browser.newContext());
       const page = context.pages()[0] ?? (await context.newPage());

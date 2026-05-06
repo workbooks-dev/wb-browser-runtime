@@ -33,8 +33,8 @@ specific run.
 
 ## Vendor selection
 
-`WB_BROWSER_VENDOR` — `browserbase` (default) or `browser-use`. Resolved once
-at sidecar boot; there is no per-slice override.
+`WB_BROWSER_VENDOR` — `browserbase` (default), `browser-use`, or `local`.
+Resolved once at sidecar boot; there is no per-slice override.
 
 ### Browserbase (default)
 
@@ -54,6 +54,40 @@ Profile (auth state) is selected per-runbook via the `profile_id:` field on a
 `browser` block — see "Profiles" below. `BROWSER_USE_PROFILE_ID` is read as a
 default when the browser block omits `profile_id:`; a per-runbook `profile_id:`
 always wins over the env var.
+
+### local
+
+`WB_BROWSER_VENDOR=local` drives a host-installed Playwright Chromium directly
+— no API keys, no network calls, no per-session cost. Use for dev iteration
+when you'd otherwise burn vendor minutes on broken selectors.
+
+| Env var                              | Default      | Purpose                                              |
+|--------------------------------------|--------------|------------------------------------------------------|
+| `WB_BROWSER_LOCAL_HEADLESS`          | `1`          | Set `0`/`false` for a visible browser window.        |
+| `WB_BROWSER_LOCAL_EXECUTABLE_PATH`   | *(unset)*    | Absolute path to a Chrome/Chromium binary. Overrides Playwright's bundled download. |
+| `WB_BROWSER_LOCAL_CHANNEL`           | *(unset)*    | Playwright channel name (`chrome`, `msedge`, `chrome-beta`, ...) for an OS-installed browser. Mutually exclusive with `EXECUTABLE_PATH`. |
+
+Trade-offs vs cloud vendors:
+
+- **No live URL.** `slice.session_started.live_url` is `null` — no remote
+  inspector, no Loom-style live preview. Use a non-headless run with
+  `WB_BROWSER_LOCAL_HEADLESS=0` if you want to watch.
+- **No persistent profile.** Each run starts with a clean Chromium state.
+  Cloud-side "profile" features (auth-state binding) aren't available.
+- **No resume after pause.** If a workbook hits a `wait` fence that suspends
+  the sidecar, the in-process Chromium dies with it. On `wb resume` the
+  local provider re-allocates a fresh browser. Cloud vendors can keep the
+  session alive for resume.
+
+First-time install:
+
+```bash
+npx playwright install chromium
+```
+
+If you skip this, `allocate()` fails with a hint pointing back at the
+install command. Or set `WB_BROWSER_LOCAL_EXECUTABLE_PATH` /
+`WB_BROWSER_LOCAL_CHANNEL` to use a system browser without the download.
 
 ## Profiles
 
