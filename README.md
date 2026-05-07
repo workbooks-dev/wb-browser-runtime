@@ -208,6 +208,7 @@ example, see the `browserbase-hn-upvoted-probe` runbook in the xatabase repo.
 | `assert`     | `assert: <selector>`        | `selector`, `text_contains`, `url_contains`     |
 | `eval`       | `eval: <js>`                | `script`                                        |
 | `save`       | `save: <name>`              | `name`, `value` (captures prior `extract`/`eval` when omitted) |
+| `download`   | `download: <selector>`      | `selector`, `path`, `timeout`, `text_fallback` (clicks + races Playwright `download` event with in-page blob/anchor capture; saves into `$WB_ARTIFACTS_DIR/<path>`) |
 
 `extract`'s `fields` entries are either a CSS selector string (returns
 `textContent`), or `{ selector, attr }` to read an attribute.
@@ -279,6 +280,36 @@ When an allowlist is set, non-matching downloads are cancelled and
 emitted as `slice.download_skipped` (with `reason:
 "extension_not_in_allowlist"`) so the operator sees what was discarded.
 Unset = capture everything.
+
+### Explicit `download:` verb
+
+The passive listener handles "any file the browser saves" but gives the
+runbook no control over the filename or timing. Use the `download:` verb
+when the runbook needs to click a specific button, save the result at a
+specific path, and fail loudly within ~10s if no file appears:
+
+```yaml
+- download:
+    selector: 'button:has-text("Download as xlsx")'
+    path: pilot-profit-loss.xlsx     # written to $WB_ARTIFACTS_DIR/<path>
+    timeout: 10s                      # default
+    text_fallback: "Download as xlsx" # like click — fallback when selector is brittle
+```
+
+Behaviour:
+
+- Installs a page-side blob/anchor capture hook **before** the click so a
+  synchronously-dispatched `URL.createObjectURL(blob) + <a download>.click()`
+  is observed even when Playwright's own `download` event misses it
+  (e.g. `window.location = blobUrl`).
+- Races `page.waitForEvent("download")` against the in-page hook; whichever
+  fires first wins.
+- Sets `HANDLED_MARK` on the `Download` so the always-on passive listener
+  doesn't double-save.
+- Emits `slice.artifact_saved` with `source: "download"` and
+  `provenance.verb_name: "download"`.
+- On timeout: throws with diagnostics (page URL, selector, both
+  failure reasons) AND emits a `slice.download_failed` frame.
 
 ## Protocol
 

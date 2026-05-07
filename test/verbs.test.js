@@ -22,7 +22,7 @@ import { createStubPage, captureSendFrames } from "../lib/stub-page.js";
 
 // --- registry shape ---------------------------------------------------------
 
-test("SUPPORTS lists all 14 verbs in expected order", () => {
+test("SUPPORTS lists all 15 verbs in expected order", () => {
   assert.deepEqual(SUPPORTS, [
     "goto",
     "fill",
@@ -38,6 +38,7 @@ test("SUPPORTS lists all 14 verbs in expected order", () => {
     "pause_for_human",
     "wait_for_drop",
     "announce_artifact",
+    "download",
   ]);
 });
 
