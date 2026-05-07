@@ -9,6 +9,21 @@ import { mkdtempSync, writeFileSync, existsSync, readFileSync, rmSync } from "no
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+// Poll a predicate until it returns truthy or a deadline elapses. Used to
+// wait for the listener's async chain (mkdir → saveAs → stat → send) to
+// settle without coupling to a fixed number of microtask ticks — local
+// dev passes after ~3 ticks but CI runners can take longer, especially
+// for the fs.stat() round-trip on slower I/O.
+async function waitFor(predicate, { timeoutMs = 2000, intervalMs = 10 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const v = predicate();
+    if (v) return v;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return predicate();
+}
+
 import {
   uniquePathInside,
   parseExtensionAllowlist,
@@ -203,13 +218,14 @@ test("installDownloadCapture installs a context listener and skips on extension 
     };
     registered(fakeDownload);
 
-    // Listener returns synchronously but the work is async — wait one tick.
-    await new Promise((r) => setImmediate(r));
-    await new Promise((r) => setImmediate(r));
-
-    assert.equal(cancelled, true, "skipped download should be cancelled");
-    const skipped = frames.find((f) => f.type === "slice.download_skipped");
+    // Listener returns synchronously; the work (extension check + cancel
+    // call + send) chains through promises. Poll until the skipped frame
+    // shows up rather than relying on a fixed tick count.
+    const skipped = await waitFor(() =>
+      frames.find((f) => f.type === "slice.download_skipped"),
+    );
     assert.ok(skipped, "expected slice.download_skipped frame");
+    assert.equal(cancelled, true, "skipped download should be cancelled");
     assert.equal(skipped.suggested_filename, "tracker.png");
     assert.equal(skipped.verb_index, 3);
     assert.equal(skipped.verb_name, "click");
@@ -273,15 +289,16 @@ test("installDownloadCapture saves matching downloads and emits artifact_saved",
       },
     };
     registered(fakeDownload);
-    // Wait a couple of ticks for the async chain to settle.
-    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+    // Async chain: mkdir → saveAs → stat → send. Poll for the frame
+    // rather than guessing how many ticks CI's I/O takes.
+    const saved = await waitFor(() =>
+      frames.find((f) => f.type === "slice.artifact_saved"),
+    );
+    assert.ok(saved, "expected slice.artifact_saved frame");
 
     const target = path.join(dir, "report.pdf");
     assert.equal(existsSync(target), true);
     assert.equal(readFileSync(target, "utf8"), "hello-pdf");
-
-    const saved = frames.find((f) => f.type === "slice.artifact_saved");
-    assert.ok(saved, "expected slice.artifact_saved frame");
     assert.equal(saved.filename, "report.pdf");
     assert.equal(saved.path, target);
     assert.equal(saved.bytes, "hello-pdf".length);
