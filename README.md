@@ -246,6 +246,40 @@ When `WB_ARTIFACTS_UPLOAD_URL` is set (template supports `{run_id}` and
 produced it completes. Auth reuses `WB_RECORDING_UPLOAD_SECRET`
 (`Authorization: Bearer <…>`); failures are logged and non-fatal.
 
+### Auto-captured downloads
+
+The sidecar attaches a context-level `download` listener at session
+start, so any file the browser downloads — clicked attachments, redirect
+chains that end in a binary, popup-driven Save As — is saved to
+`$WB_ARTIFACTS_DIR` automatically and emitted as a `slice.artifact_saved`
+frame (with `source: "download"` and a `provenance` block: source URL,
+page URL, the verb that was running, suggested filename). No verb call
+required. For cloud-provider browsers, Playwright streams the bytes back
+over CDP, so the file always lands on the sidecar machine where the
+artifacts dir + uploader live.
+
+Filename collisions in a single session get `-2`, `-3`, … suffixed
+(Playwright's `download.saveAs()` blindly overwrites, so we apply the
+suffixing ourselves).
+
+There is no size cap — `download.saveAs()` only resolves once the bytes
+are fully streamed, so a hung download trips the cell's own timeout
+(default 120s slice deadline; bump via `WB_SLICE_DEADLINE_MS`) and
+surfaces as a normal cell failure.
+
+To filter, set `WB_BROWSER_DOWNLOAD_EXTENSIONS` to a comma-separated
+list (case-insensitive, leading dots ignored):
+
+```yaml
+env:
+  WB_BROWSER_DOWNLOAD_EXTENSIONS: pdf,xlsx,csv,docx
+```
+
+When an allowlist is set, non-matching downloads are cancelled and
+emitted as `slice.download_skipped` (with `reason:
+"extension_not_in_allowlist"`) so the operator sees what was discarded.
+Unset = capture everything.
+
 ## Protocol
 
 Line-framed JSON, one message per line, on stdin/stdout. `stderr` is treated as

@@ -39,6 +39,7 @@ import {
   captureFailureDiagnostics,
   classifyError,
 } from "../lib/failure.js";
+import { installDownloadCapture } from "../lib/download-capture.js";
 import { SUPPORTS, runVerb, verbName } from "../verbs/index.js";
 
 const VERSION = "0.8.0";
@@ -98,7 +99,12 @@ async function ensureSession(name, { profile, restoreSession } = {}) {
         allocated._browser ??
         (await chromium.connectOverCDP(allocated.cdpUrl));
       const tConnected = Date.now();
-      const context = browser.contexts()[0] ?? (await browser.newContext());
+      // acceptDownloads is true by default for Playwright-launched contexts,
+      // but we set it explicitly so the listener installed below isn't a
+      // no-op against a vendor-provided context that opted out.
+      const context =
+        browser.contexts()[0] ??
+        (await browser.newContext({ acceptDownloads: true }));
       const page = context.pages()[0] ?? (await context.newPage());
       const consoleBuffer = attachConsoleBuffer(page);
       const tPageReady = Date.now();
@@ -113,7 +119,15 @@ async function ensureSession(name, { profile, restoreSession } = {}) {
         liveUrl,
         recording: null,
         consoleBuffer,
+        // Updated by handleSlice's verb loop so the download listener
+        // can attach `verb_index`/`verb_name` provenance to artifacts
+        // captured while a verb is running. Null between slices.
+        currentVerb: null,
       };
+
+      // Install the always-on download listener now, before any slice
+      // runs, so a download fired by the very first verb is captured.
+      installDownloadCapture(context, () => info.currentVerb);
 
       send({
         type: "slice.session_started",
@@ -320,6 +334,12 @@ async function handleSlice(msg) {
       const v = verbs[i];
       const name = verbName(v);
       const verbStart = Date.now();
+      // Tell the passive download listener which verb to blame for any
+      // download that fires during this iteration. Cleared in `finally`
+      // so a download arriving between verbs (rare, but possible during
+      // a settle/redirect) records as "no current verb" instead of
+      // sticking the previous one's name on it.
+      session.currentVerb = { index: i, name };
       try {
         const summary = await runVerb(session.page, v, i, sliceCtx, expand);
         // Pause-sentinel escape hatch: a verb signals a mid-slice halt by
@@ -395,6 +415,10 @@ async function handleSlice(msg) {
         return;
       }
     }
+    // Slice ended cleanly — clear the listener's "currently running verb"
+    // pointer so a stray late-arriving download doesn't get stamped with
+    // the last verb's name.
+    session.currentVerb = null;
     send({ type: "slice.complete" });
   } catch (e) {
     log(`[slice] unhandled: ${e.stack || e.message}`);
