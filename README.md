@@ -122,6 +122,8 @@ Verb arguments support two substitutions at dispatch time:
 
 Both forms are redacted in stdout summaries — only the verb name + selector make it into the log. Expanded values are also scrubbed from `verb.failed` / `slice.failed` error messages before they cross the stdio boundary.
 
+**Escaping.** To emit a literal `{{ … }}` that should *not* be substituted, prefix it with a backslash: `\{{ env.X }}` round-trips to the literal text `{{ env.X }}`. The escape is a single left-to-right pass, so the braces it produces are not re-scanned.
+
 **Missing-value policy.** Set `WB_SUBSTITUTION_ON_MISSING` to choose how a missing `env.X` or `artifacts.X` is handled:
 
 - `warn` (default) — log a stderr warning and substitute an empty string; the verb continues.
@@ -166,10 +168,16 @@ endpoint at session close. Recording is **off by default** — set
 | `WB_RECORDING_SCREENCAST_QUALITY`  | `60`       | JPEG quality (0–100).                             |
 | `WB_RECORDING_RRWEB`               | `1`        | Set `0` to skip rrweb even if recording is on.    |
 | `WB_RECORDING_VIDEO`               | `0` if no `ffmpeg` | Set `0` to skip video even if `ffmpeg` is present. |
+| `WB_RECORDING_MASK_ALL_INPUTS`     | `1`        | rrweb `maskAllInputs`. Set `0` to record input *values* (off by default for safety). |
+| `WB_RECORDING_MASK_TEXT_SELECTOR`  | *(unset)*  | CSS selector whose **text content** rrweb masks (e.g. `.ssn, .acct-balance`). |
+| `WB_RECORDING_BLOCK_SELECTOR`      | *(unset)*  | CSS selector rrweb records as an inert placeholder (contents never captured). |
+| `WB_RECORDING_IGNORE_SELECTOR`     | *(unset)*  | CSS selector whose input events rrweb drops entirely. |
 
 Artifacts are two parallel POSTs per session, `kind ∈ {rrweb, video}`:
 
-- **rrweb** — gzipped JSON (`application/json+gzip`) — `{ run_id, session, event_count, events: [...] }`. DOM mutations + input events captured from every page; defaults mask all inputs for PII.
+- **rrweb** — gzipped JSON (`application/json+gzip`) — `{ run_id, session, event_count, events: [...] }`. DOM mutations + input events captured from every page.
+
+  **PII scope — read this.** `maskAllInputs` (on by default) only redacts the *values* a user types into form fields. It does **not** mask field labels, placeholders, `aria-label`s, `<option>` text, or any other rendered text, and it does not alter the recorded DOM structure. A displayed account number, balance, or name that is page text — not an input value — is captured verbatim. For those, point rrweb at the sensitive nodes with `WB_RECORDING_MASK_TEXT_SELECTOR` (mask the text) or `WB_RECORDING_BLOCK_SELECTOR` (omit the subtree). When in doubt, block the region.
 - **video** — VP9 WebM (`video/webm`) — encoded from JPEG screencast frames via `ffmpeg`. Requires `ffmpeg` on `$PATH` (droplet install: `apt-get install -y ffmpeg`). If `ffmpeg` is missing the video kind silently disables and rrweb continues alone.
 
 Each POST carries headers `Authorization: Bearer <secret>`,
@@ -208,7 +216,7 @@ example, see the `browserbase-hn-upvoted-probe` runbook in the xatabase repo.
 | `assert`     | `assert: <selector>`        | `selector`, `text_contains`, `url_contains`     |
 | `eval`       | `eval: <js>`                | `script`                                        |
 | `save`       | `save: <name>`              | `name`, `value` (captures prior `extract`/`eval` when omitted) |
-| `download`   | `download: <selector>`      | `selector`, `path`, `timeout`, `text_fallback` (clicks + races Playwright `download` event with in-page blob/anchor capture; saves into `$WB_ARTIFACTS_DIR/<path>`) |
+| `download`   | `download: <selector>`      | `selector`, `path`, `timeout`, `text_fallback`, `signed_url` (clicks + races Playwright `download` event, in-page blob/anchor capture, and signed-URL export capture; saves into `$WB_ARTIFACTS_DIR/<path>`) |
 
 `extract`'s `fields` entries are either a CSS selector string (returns
 `textContent`), or `{ selector, attr }` to read an attribute.
@@ -308,8 +316,54 @@ Behaviour:
   doesn't double-save.
 - Emits `slice.artifact_saved` with `source: "download"` and
   `provenance.verb_name: "download"`.
-- On timeout: throws with diagnostics (page URL, selector, both
+- On timeout: throws with diagnostics (page URL, selector, all
   failure reasons) AND emits a `slice.download_failed` frame.
+
+#### Signed-URL export capture
+
+Some SaaS "Download" buttons never trip a Playwright `download` event or an
+in-page Blob. Instead the click calls a same-origin API that returns JSON like
+`{ "download_url": "https://bucket.s3.amazonaws.com/…?<signed>" }` and then
+navigates to that URL — and a page-side `fetch(signedUrl)` fails because the
+object store's CORS policy won't let the app origin read the bytes.
+
+The `download:` verb adds a **third** capture racer for this: it wraps the
+page's `fetch`/`XHR` around the click, inspects small same-origin JSON
+responses for URL-looking fields, and when it finds one pointing at a
+recognized object-store host (S3, GCS, CloudFront, Azure Blob, R2), it
+downloads the bytes **from the sidecar process** (where CORS doesn't apply)
+and saves them like any other artifact.
+
+This is **on by default in `auto` mode** — it only fires when a recognized
+signed host appears in a JSON response around the click, so a normal
+Playwright/blob download is unaffected. Tune or disable it per verb:
+
+```yaml
+- download:
+    selector: 'button:has-text("Download as xlsx")'
+    path: pilot-profit-loss.xlsx
+    timeout: 10s
+    signed_url:
+      enabled: true          # true | false | auto (default auto)
+      hosts:                 # extra non-recognized hosts to accept
+        - pilot-report-downloads.s3.amazonaws.com
+      json_fields:           # restrict to these response field names
+        - download_url
+```
+
+- Set `signed_url: false` to turn the capture off entirely for a verb.
+- In `auto` mode only recognized object-store hosts (or an explicit `hosts:`
+  entry) are fetched. With `enabled: true` an explicit `hosts:`/`json_fields:`
+  match is honored even for an unrecognized host, since you named it.
+- The captured URL's **query string (where signed credentials live) is
+  redacted** everywhere it crosses the stdio boundary — `provenance.signed_url`
+  is `origin+path?<redacted>`; the full URL stays only in sidecar memory for the
+  fetch. Honors `WB_BROWSER_DOWNLOAD_EXTENSIONS`.
+- The saved frame carries `provenance.capture: "signed_url"` plus `api_url`,
+  `field`, `content_type`, and `content_disposition`.
+- A 403 on the signed URL (expired token) emits `slice.download_failed` with
+  `expired: true` and `http_status: 403` so the operator knows to shorten the
+  click→fetch gap.
 
 ## Protocol
 
@@ -321,8 +375,25 @@ opaque diagnostics by `wb` and printed dimmed to the user's terminal.
 ```
 wb  →  {"type": "hello", "wb_version": "...", "protocol": "wb-sidecar/1"}
 wb  ←  {"type": "ready", "runtime": "wb-browser-runtime", "version": "...",
-        "protocol": "wb-sidecar/1", "supports": ["goto", "click", "fill", ...]}
+        "protocol": "wb-sidecar/1", "min_protocol": "wb-sidecar/1",
+        "supports": ["goto", "click", "fill", ...],
+        "features": ["recording", "pause", "substitution",
+                     "substitution_escape", "download_capture",
+                     "signed_url_download"]}
 ```
+
+The `ready` frame advertises capabilities so a client can feature-detect
+without a hard-coded version→capability map:
+
+- `protocol` — the wire version this runtime speaks.
+- `min_protocol` — the oldest protocol version it can still interoperate with
+  (equal to `protocol` until a breaking frame change ships). A client speaking
+  an older protocol than `min_protocol` should refuse rather than guess.
+- `supports` — the per-verb list (derived from the verb registry).
+- `features` — coarse capability tokens above the verb list.
+
+`version` is read from `package.json` at boot, so it can never drift from the
+published version.
 
 ### Slice
 

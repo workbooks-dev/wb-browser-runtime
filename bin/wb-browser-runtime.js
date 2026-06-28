@@ -25,9 +25,7 @@
 
 import readline from "node:readline";
 import { chromium } from "playwright-core";
-import { readFileSync } from "node:fs";
 import { send, log } from "../lib/io.js";
-import { resolveInside } from "../lib/util.js";
 import { SessionManager } from "../lib/session-manager.js";
 import {
   RecordingManager,
@@ -40,9 +38,31 @@ import {
   classifyError,
 } from "../lib/failure.js";
 import { installDownloadCapture } from "../lib/download-capture.js";
+import { expand, scrubSecrets } from "../lib/substitution.js";
 import { SUPPORTS, runVerb, verbName } from "../verbs/index.js";
+import pkg from "../package.json" with { type: "json" };
 
-const VERSION = "0.8.0";
+// Read the version from package.json so the `ready` frame can never drift from
+// the published version (it used to be a hand-maintained literal that fell out
+// of sync). Node >=24 supports JSON import attributes natively.
+const VERSION = pkg.version;
+
+// Protocol capability advertisement. `protocol` is the wire version we speak;
+// `min_protocol` is the oldest version a peer may speak and still interoperate
+// (we keep it equal to `protocol` until we ship a breaking frame change).
+// `features` is a coarse capability list above the per-verb `supports` array —
+// a client can feature-detect without hard-coding a version→capability map.
+const PROTOCOL = "wb-sidecar/1";
+const MIN_PROTOCOL = "wb-sidecar/1";
+const FEATURES = [
+  "recording", // rrweb DOM capture + CDP screencast video
+  "pause", // pause_for_human operator handoff
+  "substitution", // {{ env.X }} / {{ artifacts.X }}
+  "substitution_escape", // \{{ literal-brace escape
+  "download_capture", // passive + explicit download artifact capture
+  "signed_url_download", // server-side fetch of in-JSON signed export URLs
+];
+
 const provider = getProvider();
 log(`[provider] ${provider.name}`);
 
@@ -158,108 +178,9 @@ async function ensureSession(name, { profile, restoreSession } = {}) {
     }
   });
 }
-// --- {{ env.X }} / {{ artifacts.X }} substitution --------------------------
-
-const ENV_RE = /\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
-// Artifact names are bare identifiers — no dots, no slashes. Anything more
-// exotic would invite path traversal once composed with WB_ARTIFACTS_DIR.
-const ARTIFACT_RE = /\{\{\s*artifacts\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}/g;
-
-// Resolved once at module load. `warn` matches historical behavior
-// (log + empty string, runbook continues). `error` throws so a missing OTP
-// or env var fails the slice instead of silently sending an empty value
-// into a Playwright action. `empty` is the silent variant.
-const ON_MISSING = (() => {
-  const raw = (process.env.WB_SUBSTITUTION_ON_MISSING || "warn")
-    .trim()
-    .toLowerCase();
-  if (raw === "error" || raw === "empty" || raw === "warn") return raw;
-  log(
-    `[warn] WB_SUBSTITUTION_ON_MISSING=${raw} is not valid (warn|error|empty); defaulting to warn`,
-  );
-  return "warn";
-})();
-
-function handleMissingSubstitution(kind, name) {
-  const msg = `${kind}.${name} is not set`;
-  if (ON_MISSING === "error") {
-    throw new Error(`substitution: ${msg}`);
-  }
-  if (ON_MISSING === "warn") {
-    log(`[warn] ${msg}; substituting empty string`);
-  }
-  return "";
-}
-
-function readArtifactRaw(name) {
-  const dir = (process.env.WB_ARTIFACTS_DIR || "").trim();
-  if (!dir) {
-    log(`[warn] artifacts.${name} referenced but WB_ARTIFACTS_DIR is not set`);
-    return null;
-  }
-  for (const candidate of [`${name}.txt`, name]) {
-    const full = resolveInside(dir, candidate);
-    if (!full) continue;
-    try {
-      return readFileSync(full, "utf8").trimEnd();
-    } catch {
-      // try next candidate
-    }
-  }
-  return null;
-}
-
-function readArtifact(name, cache) {
-  if (cache && cache.has(name)) {
-    const hit = cache.get(name);
-    if (hit === null) return handleMissingSubstitution("artifacts", name);
-    return hit;
-  }
-  const v = readArtifactRaw(name);
-  if (cache) cache.set(name, v);
-  if (v === null) return handleMissingSubstitution("artifacts", name);
-  return v;
-}
-
-function expand(value, collected, artifactCache) {
-  if (typeof value === "string") {
-    return value
-      .replace(ENV_RE, (_, name) => {
-        const v = process.env[name];
-        if (v === undefined) return handleMissingSubstitution("env", name);
-        if (collected && v.length >= 3) collected.add(v);
-        return v;
-      })
-      .replace(ARTIFACT_RE, (_, name) => {
-        const v = readArtifact(name, artifactCache);
-        if (collected && v && v.length >= 3) collected.add(v);
-        return v;
-      });
-  }
-  if (Array.isArray(value))
-    return value.map((v) => expand(v, collected, artifactCache));
-  if (value && typeof value === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(value))
-      out[k] = expand(v, collected, artifactCache);
-    return out;
-  }
-  return value;
-}
-
-// Scrub any values that came from {{ env.X }} / {{ artifacts.X }} expansion
-// out of error messages before they cross the stdio boundary — Playwright and
-// fetch errors sometimes echo their inputs (URLs, script bodies, assertion
-// text) and those inputs may contain credentials.
-function scrubSecrets(msg, secrets) {
-  let out = String(msg == null ? "" : msg);
-  if (!secrets) return out;
-  for (const s of secrets) {
-    if (!s) continue;
-    out = out.split(s).join("«***»");
-  }
-  return out;
-}
+// {{ env.X }} / {{ artifacts.X }} substitution + `\{{` escape + secret scrubbing
+// live in lib/substitution.js (extracted so they're unit-testable without
+// booting the sidecar).
 
 // --- Slice handler ----------------------------------------------------------
 
@@ -559,8 +480,10 @@ rl.on("line", (line) => {
         type: "ready",
         runtime: "wb-browser-runtime",
         version: VERSION,
-        protocol: "wb-sidecar/1",
+        protocol: PROTOCOL,
+        min_protocol: MIN_PROTOCOL,
         supports: SUPPORTS,
+        features: FEATURES,
       });
       break;
     case "slice":
