@@ -415,3 +415,163 @@ test("download surfaces click failure over generic 'no file captured' message", 
     (e) => e === clickErr,
   );
 });
+
+// --- 5. Signed-URL export capture ------------------------------------------
+
+// Stub globalThis.fetch (retryableFetch uses the global) and record the URL it
+// was called with so we can assert the sidecar fetched the FULL signed URL.
+function stubFetch(t, impl) {
+  const prev = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    calls.push({ url, opts });
+    return impl(url, opts);
+  };
+  t.after(() => {
+    globalThis.fetch = prev;
+  });
+  return calls;
+}
+
+// evaluateImpl that serves one signed candidate on the first SIGNED_POLL and
+// nothing on the blob poll. Distinguishes install vs poll by script content.
+function signedEvaluateImpl(candidate) {
+  let served = false;
+  return (script) => {
+    if (script.includes("Installed")) return null; // hook installs
+    if (script.includes("__wbSignedCandidates")) {
+      if (served) return [];
+      served = true;
+      return [candidate];
+    }
+    if (script.includes("__wbDownload")) return null; // blob poll: nothing
+    return null;
+  };
+}
+
+test("download captures a signed export URL and fetches it server-side", async (t) => {
+  const dir = await withArtifactsDir(t);
+  const cap = captureSendFrames();
+  t.after(cap.dispose);
+
+  const signedUrl = "https://bucket.s3.amazonaws.com/reports/pl.xlsx?X-Amz-Signature=deadbeef";
+  const fetchCalls = stubFetch(t, async () =>
+    new Response(Buffer.from("xlsx-from-s3"), {
+      status: 200,
+      headers: { "content-type": "application/vnd.ms-excel" },
+    }),
+  );
+
+  // Playwright download never fires; the blob hook sees nothing. Only the
+  // signed-URL JSON response is observed.
+  const { page } = makePage({
+    waitForEventImpl: () => new Promise(() => {}),
+    evaluateImpl: signedEvaluateImpl({
+      api_url: "https://app.example.com/reports/1/download",
+      urls: [{ field: "download_url", url: signedUrl }],
+    }),
+  });
+
+  const summary = await VERB_REGISTRY.download.execute(
+    page,
+    { selector: "button.export", path: "pl.xlsx", timeout: 2000 },
+    { index: 3 },
+  );
+
+  assert.equal(summary, "→ pl.xlsx");
+  const target = path.join(dir, "pl.xlsx");
+  assert.equal(existsSync(target), true);
+  assert.equal((await readFile(target)).toString(), "xlsx-from-s3");
+
+  // Sidecar fetched the FULL signed URL (credentials intact for the GET).
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].url, signedUrl);
+
+  const saved = cap.frames.find((f) => f.type === "slice.artifact_saved");
+  assert.ok(saved, "expected slice.artifact_saved");
+  assert.equal(saved.provenance.capture, "signed_url");
+  assert.equal(saved.provenance.field, "download_url");
+  assert.equal(saved.provenance.api_url, "https://app.example.com/reports/1/download");
+  assert.equal(saved.provenance.content_type, "application/vnd.ms-excel");
+  // The signed URL is redacted everywhere it crosses the boundary.
+  assert.equal(
+    saved.provenance.signed_url,
+    "https://bucket.s3.amazonaws.com/reports/pl.xlsx?<redacted>",
+  );
+  assert.equal(saved.provenance.url, null);
+});
+
+test("download emits download_failed with expired:true on a 403 signed URL", async (t) => {
+  await withArtifactsDir(t);
+  const cap = captureSendFrames();
+  t.after(cap.dispose);
+
+  const signedUrl = "https://bucket.s3.amazonaws.com/reports/pl.xlsx?X-Amz-Signature=stale";
+  stubFetch(t, async () => new Response("AccessDenied", { status: 403 }));
+
+  const { page } = makePage({
+    waitForEventImpl: () => new Promise(() => {}),
+    evaluateImpl: signedEvaluateImpl({
+      api_url: "https://app.example.com/reports/1/download",
+      urls: [{ field: "download_url", url: signedUrl }],
+    }),
+  });
+
+  await assert.rejects(
+    () =>
+      VERB_REGISTRY.download.execute(
+        page,
+        { selector: "button.export", path: "pl.xlsx", timeout: 2000 },
+        { index: 0 },
+      ),
+    /HTTP 403.*expired/,
+  );
+
+  const failed = cap.frames.find((f) => f.type === "slice.download_failed");
+  assert.ok(failed, "expected slice.download_failed");
+  assert.equal(failed.capture, "signed_url");
+  assert.equal(failed.http_status, 403);
+  assert.equal(failed.expired, true);
+  assert.equal(failed.signed_url, "https://bucket.s3.amazonaws.com/reports/pl.xlsx?<redacted>");
+});
+
+test("download with signed_url:false does not install the signed hook", async (t) => {
+  await withArtifactsDir(t);
+  const cap = captureSendFrames();
+  t.after(cap.dispose);
+
+  const scripts = [];
+  const { page } = makePage({
+    waitForEventImpl: async () => {
+      const err = new Error("timeout");
+      err.name = "TimeoutError";
+      throw err;
+    },
+    evaluateImpl: (script) => {
+      scripts.push(script);
+      return null;
+    },
+  });
+
+  await assert.rejects(
+    () =>
+      VERB_REGISTRY.download.execute(
+        page,
+        { selector: "button.export", signed_url: false, timeout: 100 },
+        { index: 0 },
+      ),
+    /no file captured/,
+  );
+
+  // No signed hook install and no signed poll happened.
+  assert.equal(
+    scripts.some((s) => s.includes("__wbSignedInstalled")),
+    false,
+    "signed hook should not be installed when signed_url:false",
+  );
+  assert.equal(
+    scripts.some((s) => s.includes("__wbSignedCandidates")),
+    false,
+    "signed poll should not run when signed_url:false",
+  );
+});

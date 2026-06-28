@@ -26,6 +26,14 @@ import {
   extensionAllowed,
 } from "../lib/util.js";
 import { HANDLED_MARK } from "../lib/download-capture.js";
+import { retryableFetch } from "../lib/http.js";
+import {
+  SIGNED_PAGE_HOOK,
+  SIGNED_POLL_SCRIPT,
+  parseSignedConfig,
+  pickSignedCandidate,
+  redactSignedUrl,
+} from "../lib/signed-url-capture.js";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const POLL_INTERVAL_MS = 50;
@@ -114,15 +122,24 @@ export default {
     const allowlist = parseExtensionAllowlist(
       process.env.WB_BROWSER_DOWNLOAD_EXTENSIONS,
     );
+    const signedCfg = parseSignedConfig(args.signed_url);
+    const signedEnabled = signedCfg.enabled !== false;
 
     // 1) Inject the page-side blob/anchor capture hook BEFORE the click so a
     //    synchronously-dispatched anchor.click() inside the SPA's handler is
     //    observed. Best-effort: a frame mid-navigation can reject evaluate;
     //    the Playwright `download` event still works and is the primary
-    //    signal anyway.
+    //    signal anyway. When signed-URL capture is enabled, install its
+    //    fetch/XHR response hook in the same pre-click window so the API call
+    //    the click triggers is observed from the start.
     try {
       await page.evaluate(PAGE_HOOK);
     } catch {}
+    if (signedEnabled) {
+      try {
+        await page.evaluate(SIGNED_PAGE_HOOK);
+      } catch {}
+    }
 
     // 2) Claim ownership of the next download synchronously — prepended to
     //    BrowserContext listeners so it runs before lib/download-capture.js's
@@ -148,16 +165,25 @@ export default {
       }
     }
 
+    // Shared cancellation token: once the race has a winner, the losing
+    // pollers stop on their next tick instead of spinning page.evaluate against
+    // a (possibly navigating/closing) page for the rest of the timeout window.
+    const stop = { done: false };
+
     try {
-      // 3) Race the two capture sources against the click. The download event
-      //    AND the click run concurrently — Playwright's standard pattern,
-      //    since the click can resolve before or after the download fires.
+      // 3) Race the capture sources against the click. The download event AND
+      //    the click run concurrently — Playwright's standard pattern, since
+      //    the click can resolve before or after the download fires.
       const downloadPromise = page
         .waitForEvent("download", { timeout })
         .then((d) => ({ kind: "playwright", download: d }))
         .catch((e) => ({ kind: "playwright_failed", error: e }));
 
-      const blobPromise = pollForBlob(page, timeout);
+      const blobPromise = pollForBlob(page, timeout, stop);
+
+      const signedPromise = signedEnabled
+        ? pollForSignedUrl(page, timeout, signedCfg, stop)
+        : null;
 
       let clickError = null;
       const clickPromise = (async () => {
@@ -181,7 +207,11 @@ export default {
         }
       })();
 
-      const winner = await raceCaptures(downloadPromise, blobPromise);
+      const winner = await raceCaptures(
+        [downloadPromise, blobPromise, signedPromise].filter(Boolean),
+      );
+      // Winner decided (success or all-failed) — release the losing pollers.
+      stop.done = true;
       // Wait for the click to settle so we surface its error (if any) over
       // a generic "no file captured" — a click that never landed is the
       // more actionable failure.
@@ -208,6 +238,17 @@ export default {
           ctx,
         });
       }
+      if (winner.success && winner.kind === "signed_url") {
+        return await saveSignedUrlDownload({
+          signed: winner.signed,
+          artifactsDir,
+          allowlist,
+          explicitPath,
+          page,
+          ctx,
+          timeout,
+        });
+      }
 
       // No capture won — emit structured failure diagnostics.
       const reasons = winner.failures
@@ -217,6 +258,9 @@ export default {
           }
           if (f.kind === "blob_failed") return `blob hook: ${f.error}`;
           if (f.kind === "blob_timeout") return `blob hook: no capture within ${timeout}ms`;
+          if (f.kind === "signed_failed") return `signed url: ${f.error}`;
+          if (f.kind === "signed_timeout")
+            return `signed url: no signed file URL seen within ${timeout}ms`;
           return f.kind;
         })
         .join("; ");
@@ -233,6 +277,9 @@ export default {
         `download: no file captured within ${timeout}ms after clicking ${args.selector} (page=${safePageUrl(page) || "?"}). ${reasons}`,
       );
     } finally {
+      // Backstop: ensure pollers are released on any exit path (thrown
+      // click/save error, extension rejection, etc.).
+      stop.done = true;
       if (attached && browserContext && typeof browserContext.off === "function") {
         try {
           browserContext.off("download", claim);
@@ -333,13 +380,17 @@ async function saveBlobDownload({
   return `→ ${path.basename(target)}`;
 }
 
-// Race two capture promises. First to report success wins. Both must report
-// before we declare failure, so the diagnostics frame can list every reason
-// the verb didn't see a file. (Promise.race would shortcut on a fast failure
-// and discard the slower success.)
-function raceCaptures(downloadPromise, blobPromise) {
+// Race N capture promises. First to report success wins. Every source must
+// report before we declare failure, so the diagnostics frame can list every
+// reason the verb didn't see a file. (Promise.race would shortcut on a fast
+// failure and discard a slower success.) Each promise resolves to an object
+// whose `kind` names the source: a success kind ("playwright" | "blob" |
+// "signed_url") or a failure kind ("*_failed" | "*_timeout").
+const SUCCESS_KINDS = new Set(["playwright", "blob", "signed_url"]);
+
+function raceCaptures(promises) {
   return new Promise((resolve) => {
-    let outstanding = 2;
+    let outstanding = promises.length;
     const failures = [];
     const finish = (settled) => {
       if (settled.success) {
@@ -349,20 +400,123 @@ function raceCaptures(downloadPromise, blobPromise) {
       failures.push(settled);
       if (--outstanding === 0) resolve({ success: false, failures });
     };
-    downloadPromise.then((r) => {
-      if (r.kind === "playwright") finish({ success: true, ...r });
-      else finish({ success: false, ...r });
-    });
-    blobPromise.then((r) => {
-      if (r.kind === "blob") finish({ success: true, ...r });
-      else finish({ success: false, ...r });
-    });
+    for (const pr of promises) {
+      pr.then((r) => {
+        if (SUCCESS_KINDS.has(r.kind)) finish({ success: true, ...r });
+        else finish({ success: false, ...r });
+      });
+    }
   });
 }
 
-async function pollForBlob(page, timeoutMs) {
+async function saveSignedUrlDownload({
+  signed,
+  artifactsDir,
+  allowlist,
+  explicitPath,
+  page,
+  ctx,
+  timeout,
+}) {
+  const redacted = redactSignedUrl(signed.url);
+  // Filename: explicit path: wins, else the signed URL's basename, else a
+  // generic fallback. (S3 keys usually end in the real filename.)
+  let nameFromUrl = "";
+  try {
+    nameFromUrl = path.basename(new URL(signed.url).pathname) || "";
+  } catch {}
+  const suggested = explicitPath || (nameFromUrl.trim() ? nameFromUrl : FALLBACK_NAME);
+  if (!extensionAllowed(suggested, allowlist)) {
+    throw new Error(
+      `download: file "${suggested}" rejected by WB_BROWSER_DOWNLOAD_EXTENSIONS`,
+    );
+  }
+  const target = uniquePathInside(artifactsDir, suggested);
+  if (!target) {
+    throw new Error(
+      `download: refusing to save "${suggested}" — resolves outside $WB_ARTIFACTS_DIR`,
+    );
+  }
+  await fsPromises.mkdir(artifactsDir, { recursive: true });
+
+  // Fetch the signed URL from the sidecar (not the page) so the object store's
+  // CORS policy doesn't block the read. The label is redacted — retry logs must
+  // never echo signed credentials.
+  let res;
+  try {
+    res = await retryableFetch(
+      signed.url,
+      { method: "GET" },
+      `signed-url download (${redacted})`,
+      { timeoutMs: timeout },
+    );
+  } catch (e) {
+    send({
+      type: "slice.download_failed",
+      verb: "download",
+      verb_index: ctx?.index ?? null,
+      capture: "signed_url",
+      api_url: signed.api_url,
+      signed_url: redacted,
+      page_url: safePageUrl(page),
+      reason: `signed url fetch error: ${e?.message || e}`,
+    });
+    throw new Error(
+      `download: signed URL fetch failed for ${redacted}: ${e?.message || e}`,
+    );
+  }
+  if (!res.ok) {
+    // A 403 on a pre-signed URL almost always means the token expired before
+    // we fetched it — call that out so the operator knows to shorten the gap.
+    const expired = res.status === 403;
+    send({
+      type: "slice.download_failed",
+      verb: "download",
+      verb_index: ctx?.index ?? null,
+      capture: "signed_url",
+      api_url: signed.api_url,
+      signed_url: redacted,
+      page_url: safePageUrl(page),
+      http_status: res.status,
+      expired,
+      reason: `signed url fetch: HTTP ${res.status}${expired ? " (likely expired)" : ""}`,
+    });
+    throw new Error(
+      `download: signed URL fetch returned HTTP ${res.status} for ${redacted}${expired ? " (likely expired)" : ""}`,
+    );
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  await fsPromises.writeFile(target, buf);
+  const contentType = safeHeader(res, "content-type");
+  const contentDisposition = safeHeader(res, "content-disposition");
+  send({
+    type: "slice.artifact_saved",
+    filename: path.basename(target),
+    path: target,
+    bytes: buf.length,
+    source: "download",
+    provenance: {
+      url: null,
+      signed_url: redacted,
+      api_url: signed.api_url,
+      field: signed.field,
+      suggested_filename: suggested,
+      page_url: safePageUrl(page),
+      verb_index: ctx?.index ?? null,
+      verb_name: "download",
+      capture: "signed_url",
+      content_type: contentType,
+      content_disposition: contentDisposition,
+      ts: Date.now(),
+    },
+  });
+  return `→ ${path.basename(target)}`;
+}
+
+async function pollForBlob(page, timeoutMs, stop) {
   const deadline = Date.now() + timeoutMs;
   while (true) {
+    if (stop?.done) return { kind: "blob_timeout" };
     let result;
     try {
       result = await page.evaluate(POLL_SCRIPT);
@@ -373,6 +527,38 @@ async function pollForBlob(page, timeoutMs) {
     if (result && result.error) return { kind: "blob_failed", error: result.error };
     if (Date.now() >= deadline) return { kind: "blob_timeout" };
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+}
+
+// Poll the page-side signed-URL candidate buffer until a candidate matching
+// the configured policy appears or the deadline passes. The bytes are NOT
+// fetched here — the winner is fetched server-side by saveSignedUrlDownload so
+// CORS doesn't apply. Returns the picked candidate; never throws (page
+// evaluate errors degrade to "keep polling").
+async function pollForSignedUrl(page, timeoutMs, signedCfg, stop) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    if (stop?.done) return { kind: "signed_timeout" };
+    let cands = null;
+    try {
+      cands = await page.evaluate(SIGNED_POLL_SCRIPT);
+    } catch {
+      cands = null;
+    }
+    if (Array.isArray(cands) && cands.length) {
+      const picked = pickSignedCandidate(cands, signedCfg);
+      if (picked) return { kind: "signed_url", signed: picked };
+    }
+    if (Date.now() >= deadline) return { kind: "signed_timeout" };
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+}
+
+function safeHeader(res, name) {
+  try {
+    return res.headers?.get?.(name) || null;
+  } catch {
+    return null;
   }
 }
 
