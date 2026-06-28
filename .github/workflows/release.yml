@@ -12,17 +12,21 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
       - run: npm ci
+        timeout-minutes: 10
       - run: npm test
+        timeout-minutes: 10
 
   publish:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v5
@@ -30,6 +34,7 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
       - run: npm ci
+        timeout-minutes: 10
 
       - name: Verify tag matches package.json version
         run: |
@@ -44,15 +49,18 @@ jobs:
       # `id-token: write` above + the GitHub/workflow trust configured in
       # the npm package's "Trusted Publishers" settings is sufficient.
       - run: npm publish --provenance --access public
+        timeout-minutes: 10
 
   github-release:
     needs: publish
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+        timeout-minutes: 10
         run: |
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
