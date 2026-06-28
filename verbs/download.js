@@ -18,7 +18,8 @@
 
 import path from "node:path";
 import { Buffer } from "node:buffer";
-import { promises as fsPromises } from "node:fs";
+import { promises as fsPromises, createWriteStream } from "node:fs";
+import { once } from "node:events";
 import { send } from "../lib/io.js";
 import {
   uniquePathInside,
@@ -26,18 +27,56 @@ import {
   extensionAllowed,
 } from "../lib/util.js";
 import { HANDLED_MARK } from "../lib/download-capture.js";
-import { retryableFetch } from "../lib/http.js";
+import {
+  guardedDownloadFetch,
+  releaseBodyTimeout,
+  abortBody,
+  drainResponseBody,
+} from "../lib/http.js";
 import {
   SIGNED_PAGE_HOOK,
   SIGNED_POLL_SCRIPT,
   parseSignedConfig,
   pickSignedCandidate,
   redactSignedUrl,
+  isSignedHost,
 } from "../lib/signed-url-capture.js";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const POLL_INTERVAL_MS = 50;
 const FALLBACK_NAME = "download.bin";
+
+// Hard cap on signed-URL download size to bound memory/disk. A lying or absent
+// Content-Length can't bypass it: the stream is aborted once bytes exceed it.
+// Override for tests/ops via WB_MAX_DOWNLOAD_BYTES.
+const MAX_SIGNED_DOWNLOAD_BYTES = 512 * 1024 * 1024; // 512 MiB
+
+function maxDownloadBytes() {
+  const v = Number(process.env.WB_MAX_DOWNLOAD_BYTES);
+  return Number.isFinite(v) && v > 0 ? v : MAX_SIGNED_DOWNLOAD_BYTES;
+}
+
+// Test/ops escape hatch: by default the SSRF guard rejects targets that resolve
+// to private/loopback IPs. A local test server lives on 127.0.0.1, so the guard
+// must be opt-out-able for those tests. Production leaves this unset.
+function privateDownloadIpAllowed() {
+  const v = String(process.env.WB_ALLOW_PRIVATE_DOWNLOAD_IP || "").toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+// Build the host validator applied to the initial signed URL *and* every
+// redirect hop — the same gate pickSignedCandidate uses, so a redirect can't
+// escape to a host the picker would never have selected.
+function makeSignedHostValidator(signedCfg) {
+  const hosts = (signedCfg && signedCfg.hosts) || [];
+  return (host) => {
+    if (!host) return false;
+    const h = String(host).toLowerCase();
+    const hostAllowed =
+      hosts.length > 0 && hosts.some((x) => h === x || h.endsWith(`.${x}`));
+    return hostAllowed || isSignedHost(h);
+  };
+}
 
 // Page-side hook that traps blob/data-URL anchor clicks the SPA performs
 // programmatically — `URL.createObjectURL(blob)` + `<a download>` + `.click()`.
@@ -247,6 +286,7 @@ export default {
           page,
           ctx,
           timeout,
+          signedCfg,
         });
       }
 
@@ -417,6 +457,7 @@ async function saveSignedUrlDownload({
   page,
   ctx,
   timeout,
+  signedCfg,
 }) {
   const redacted = redactSignedUrl(signed.url);
   // Filename: explicit path: wins, else the signed URL's basename, else a
@@ -439,18 +480,8 @@ async function saveSignedUrlDownload({
   }
   await fsPromises.mkdir(artifactsDir, { recursive: true });
 
-  // Fetch the signed URL from the sidecar (not the page) so the object store's
-  // CORS policy doesn't block the read. The label is redacted — retry logs must
-  // never echo signed credentials.
-  let res;
-  try {
-    res = await retryableFetch(
-      signed.url,
-      { method: "GET" },
-      `signed-url download (${redacted})`,
-      { timeoutMs: timeout },
-    );
-  } catch (e) {
+  const maxBytes = maxDownloadBytes();
+  const failed = (extra, reason) =>
     send({
       type: "slice.download_failed",
       verb: "download",
@@ -459,58 +490,161 @@ async function saveSignedUrlDownload({
       api_url: signed.api_url,
       signed_url: redacted,
       page_url: safePageUrl(page),
-      reason: `signed url fetch error: ${e?.message || e}`,
+      ...extra,
+      reason,
     });
+
+  // Fetch the signed URL from the sidecar (not the page) so the object store's
+  // CORS policy doesn't block the read. Redirects are followed *manually* with
+  // the same host allowlist + private-IP block applied to every hop (SSRF), and
+  // the body-read timeout stays armed until we finish streaming. The label is
+  // redacted — retry logs must never echo signed credentials.
+  let res;
+  try {
+    res = await guardedDownloadFetch(signed.url, {
+      timeoutMs: timeout,
+      validateHost: makeSignedHostValidator(signedCfg),
+      allowPrivateIp: privateDownloadIpAllowed(),
+      label: `signed-url download (${redacted})`,
+    });
+  } catch (e) {
+    failed({}, `signed url fetch error: ${e?.message || e}`);
     throw new Error(
       `download: signed URL fetch failed for ${redacted}: ${e?.message || e}`,
     );
   }
-  if (!res.ok) {
-    // A 403 on a pre-signed URL almost always means the token expired before
-    // we fetched it — call that out so the operator knows to shorten the gap.
-    const expired = res.status === 403;
+
+  try {
+    if (!res.ok) {
+      // A 403 on a pre-signed URL almost always means the token expired before
+      // we fetched it — call that out so the operator knows to shorten the gap.
+      const expired = res.status === 403;
+      await drainResponseBody(res); // don't leak the socket
+      failed(
+        { http_status: res.status, expired },
+        `signed url fetch: HTTP ${res.status}${expired ? " (likely expired)" : ""}`,
+      );
+      throw new Error(
+        `download: signed URL fetch returned HTTP ${res.status} for ${redacted}${expired ? " (likely expired)" : ""}`,
+      );
+    }
+
+    // Reject up front when the server *declares* an oversized body...
+    const clRaw = safeHeader(res, "content-length");
+    const cl = clRaw == null ? NaN : Number(clRaw);
+    if (Number.isFinite(cl) && cl > maxBytes) {
+      await drainResponseBody(res);
+      failed(
+        { content_length: cl, max_bytes: maxBytes },
+        `signed url body too large: Content-Length ${cl} > cap ${maxBytes}`,
+      );
+      throw new Error(
+        `download: signed URL body exceeds size cap (${cl} > ${maxBytes} bytes) for ${redacted}`,
+      );
+    }
+
+    // ...and enforce while streaming so a lying/absent Content-Length can't slip
+    // past. Streams to disk rather than materializing the whole body in memory.
+    let bytes;
+    try {
+      bytes = await streamToFileWithCap(res, target, maxBytes);
+    } catch (e) {
+      if (e && e.code === "WB_SIZE_CAP") {
+        failed(
+          { max_bytes: maxBytes },
+          `signed url body exceeded size cap of ${maxBytes} bytes mid-stream`,
+        );
+        throw new Error(
+          `download: signed URL body exceeded size cap (${maxBytes} bytes) for ${redacted}`,
+        );
+      }
+      failed({}, `signed url body read error: ${e?.message || e}`);
+      throw new Error(
+        `download: signed URL body read failed for ${redacted}: ${e?.message || e}`,
+      );
+    }
+
+    const contentType = safeHeader(res, "content-type");
+    const contentDisposition = safeHeader(res, "content-disposition");
     send({
-      type: "slice.download_failed",
-      verb: "download",
-      verb_index: ctx?.index ?? null,
-      capture: "signed_url",
-      api_url: signed.api_url,
-      signed_url: redacted,
-      page_url: safePageUrl(page),
-      http_status: res.status,
-      expired,
-      reason: `signed url fetch: HTTP ${res.status}${expired ? " (likely expired)" : ""}`,
+      type: "slice.artifact_saved",
+      filename: path.basename(target),
+      path: target,
+      bytes,
+      source: "download",
+      provenance: {
+        url: null,
+        signed_url: redacted,
+        api_url: signed.api_url,
+        field: signed.field,
+        suggested_filename: suggested,
+        page_url: safePageUrl(page),
+        verb_index: ctx?.index ?? null,
+        verb_name: "download",
+        capture: "signed_url",
+        content_type: contentType,
+        content_disposition: contentDisposition,
+        ts: Date.now(),
+      },
     });
-    throw new Error(
-      `download: signed URL fetch returned HTTP ${res.status} for ${redacted}${expired ? " (likely expired)" : ""}`,
-    );
+    return `→ ${path.basename(target)}`;
+  } finally {
+    // Body fully consumed (or we bailed) — disarm the body-read timeout.
+    releaseBodyTimeout(res);
   }
-  const buf = Buffer.from(await res.arrayBuffer());
-  await fsPromises.writeFile(target, buf);
-  const contentType = safeHeader(res, "content-type");
-  const contentDisposition = safeHeader(res, "content-disposition");
-  send({
-    type: "slice.artifact_saved",
-    filename: path.basename(target),
-    path: target,
-    bytes: buf.length,
-    source: "download",
-    provenance: {
-      url: null,
-      signed_url: redacted,
-      api_url: signed.api_url,
-      field: signed.field,
-      suggested_filename: suggested,
-      page_url: safePageUrl(page),
-      verb_index: ctx?.index ?? null,
-      verb_name: "download",
-      capture: "signed_url",
-      content_type: contentType,
-      content_disposition: contentDisposition,
-      ts: Date.now(),
-    },
-  });
-  return `→ ${path.basename(target)}`;
+}
+
+// Stream a response body to disk, counting bytes and aborting the in-flight
+// read once the cap is exceeded (so an absent/under-stated Content-Length can't
+// OOM us). Removes the partial file on any error. Returns total bytes written.
+async function streamToFileWithCap(res, target, maxBytes) {
+  const reader = res.body?.getReader?.();
+  const ws = createWriteStream(target);
+  let total = 0;
+  try {
+    if (!reader) {
+      // No body to read (e.g. 204) — write an empty file.
+      await new Promise((resolve, reject) =>
+        ws.end((e) => (e ? reject(e) : resolve())),
+      );
+      return 0;
+    }
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        abortBody(res); // abort the underlying socket read
+        try {
+          await reader.cancel();
+        } catch {}
+        const err = new Error(`size cap exceeded`);
+        err.code = "WB_SIZE_CAP";
+        throw err;
+      }
+      if (!ws.write(Buffer.from(value))) {
+        await once(ws, "drain");
+      }
+    }
+    await new Promise((resolve, reject) =>
+      ws.end((e) => (e ? reject(e) : resolve())),
+    );
+    return total;
+  } catch (e) {
+    // Await the stream's close before unlinking: createWriteStream opens its fd
+    // asynchronously, so unlinking eagerly can race the (lazy) open and leave a
+    // resurrected empty file behind.
+    try {
+      await new Promise((resolve) => {
+        ws.once("close", resolve);
+        ws.destroy();
+      });
+    } catch {}
+    try {
+      await fsPromises.unlink(target);
+    } catch {}
+    throw e;
+  }
 }
 
 async function pollForBlob(page, timeoutMs, stop) {

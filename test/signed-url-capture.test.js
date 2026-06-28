@@ -122,7 +122,10 @@ test("pickSignedCandidate honors an explicit hosts allowlist for non-signed host
   assert.equal(picked.host, "downloads.internal.corp");
 });
 
-test("pickSignedCandidate (forced) honors json_fields match on a non-signed host", () => {
+test("pickSignedCandidate (forced) json_fields does NOT bypass the host check", () => {
+  // Security regression guard: forced mode + json_fields previously accepted an
+  // arbitrary (non-signed, non-allowlisted) host. json_fields must only filter
+  // which fields are inspected — it can never satisfy the host gate.
   const cands = [
     {
       urls: [
@@ -132,6 +135,34 @@ test("pickSignedCandidate (forced) honors json_fields match on a non-signed host
     },
   ];
   const cfg = parseSignedConfig({ enabled: true, json_fields: ["export_href"] });
+  assert.equal(pickSignedCandidate(cands, cfg), null);
+});
+
+test("pickSignedCandidate (forced) json_fields filters but still needs a host match", () => {
+  // With a signed host the json_fields filter selects the right field.
+  const cands = [
+    {
+      urls: [
+        { field: "preview", url: "https://b.s3.amazonaws.com/preview.bin?sig=1" },
+        { field: "download_url", url: "https://b.s3.amazonaws.com/f.xlsx?sig=2" },
+      ],
+    },
+  ];
+  const cfg = parseSignedConfig({ enabled: true, json_fields: ["download_url"] });
+  const picked = pickSignedCandidate(cands, cfg);
+  assert.ok(picked);
+  assert.equal(picked.field, "download_url");
+});
+
+test("pickSignedCandidate (forced) json_fields match on an allowlisted host", () => {
+  const cands = [
+    { urls: [{ field: "export_href", url: "https://files.internal/x.csv?tok=9" }] },
+  ];
+  const cfg = parseSignedConfig({
+    enabled: true,
+    hosts: ["files.internal"],
+    json_fields: ["export_href"],
+  });
   const picked = pickSignedCandidate(cands, cfg);
   assert.ok(picked);
   assert.equal(picked.field, "export_href");

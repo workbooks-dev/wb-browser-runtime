@@ -8,6 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { rmSync } from "node:fs";
@@ -433,6 +434,23 @@ function stubFetch(t, impl) {
   return calls;
 }
 
+// Set an env var for the duration of a test, restoring the prior value after.
+function withEnv(t, key, value) {
+  const prev = process.env[key];
+  process.env[key] = value;
+  t.after(() => {
+    if (prev === undefined) delete process.env[key];
+    else process.env[key] = prev;
+  });
+}
+
+// The SSRF guard resolves hostnames via DNS and rejects private IPs. These
+// stubbed-fetch tests target a public-looking S3 host but never make a real
+// request, so allow private IPs to avoid a real DNS lookup of a fake host.
+function allowPrivateDownloadIp(t) {
+  withEnv(t, "WB_ALLOW_PRIVATE_DOWNLOAD_IP", "1");
+}
+
 // evaluateImpl that serves one signed candidate on the first SIGNED_POLL and
 // nothing on the blob poll. Distinguishes install vs poll by script content.
 function signedEvaluateImpl(candidate) {
@@ -451,6 +469,7 @@ function signedEvaluateImpl(candidate) {
 
 test("download captures a signed export URL and fetches it server-side", async (t) => {
   const dir = await withArtifactsDir(t);
+  allowPrivateDownloadIp(t);
   const cap = captureSendFrames();
   t.after(cap.dispose);
 
@@ -503,6 +522,7 @@ test("download captures a signed export URL and fetches it server-side", async (
 
 test("download emits download_failed with expired:true on a 403 signed URL", async (t) => {
   await withArtifactsDir(t);
+  allowPrivateDownloadIp(t);
   const cap = captureSendFrames();
   t.after(cap.dispose);
 
@@ -533,6 +553,278 @@ test("download emits download_failed with expired:true on a 403 signed URL", asy
   assert.equal(failed.http_status, 403);
   assert.equal(failed.expired, true);
   assert.equal(failed.signed_url, "https://bucket.s3.amazonaws.com/reports/pl.xlsx?<redacted>");
+});
+
+// Spin up a throwaway loopback HTTP server for SSRF / size-cap tests.
+function startServer(t, handler) {
+  return new Promise((resolve) => {
+    const server = createServer(handler);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      t.after(() => new Promise((r) => server.close(r)));
+      resolve({ server, port, base: `http://127.0.0.1:${port}` });
+    });
+  });
+}
+
+// --- 6. SSRF guard: redirects + private IPs --------------------------------
+
+test("download rejects a signed URL that redirects to a disallowed host (SSRF)", async (t) => {
+  const dir = await withArtifactsDir(t);
+  // Permit the 127.0.0.1 origin itself; the redirect target host is the gate.
+  allowPrivateDownloadIp(t);
+  const cap = captureSendFrames();
+  t.after(cap.dispose);
+
+  let hits = 0;
+  const { port, base } = await startServer(t, (req, res) => {
+    hits++;
+    res.statusCode = 302;
+    // Redirect to a host that is neither a recognized signed host nor in the
+    // allowlist — the guard must refuse to follow it.
+    res.setHeader("Location", "http://blocked.example.invalid/secret.bin");
+    res.end();
+  });
+
+  const signedUrl = `${base}/start.bin`;
+  const { page } = makePage({
+    waitForEventImpl: () => new Promise(() => {}),
+    evaluateImpl: signedEvaluateImpl({
+      api_url: "https://app.example.com/d",
+      urls: [{ field: "download_url", url: signedUrl }],
+    }),
+  });
+
+  await assert.rejects(
+    () =>
+      VERB_REGISTRY.download.execute(
+        page,
+        {
+          selector: "button.export",
+          path: "out.bin",
+          timeout: 2000,
+          signed_url: { enabled: true, hosts: [`127.0.0.1:${port}`] },
+        },
+        { index: 0 },
+      ),
+    /host not allowed/,
+  );
+
+  assert.equal(hits, 1, "only the initial URL should be fetched, never the redirect");
+  assert.equal(existsSync(path.join(dir, "out.bin")), false, "no file should be written");
+  const failed = cap.frames.find((f) => f.type === "slice.download_failed");
+  assert.ok(failed, "expected slice.download_failed");
+  assert.match(failed.reason, /host not allowed/);
+});
+
+test("download rejects a signed URL host that is a private/loopback IP (SSRF)", async (t) => {
+  const dir = await withArtifactsDir(t);
+  // Deliberately do NOT allow private IPs.
+  const cap = captureSendFrames();
+  t.after(cap.dispose);
+
+  // Prove no network request is ever made — the guard rejects before fetch.
+  let fetched = false;
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetched = true;
+    throw new Error("guard should have blocked before any fetch");
+  };
+  t.after(() => {
+    globalThis.fetch = prevFetch;
+  });
+
+  const signedUrl = "http://127.0.0.1:9/secret.bin"; // loopback literal
+  const { page } = makePage({
+    waitForEventImpl: () => new Promise(() => {}),
+    evaluateImpl: signedEvaluateImpl({
+      api_url: "https://app.example.com/d",
+      urls: [{ field: "download_url", url: signedUrl }],
+    }),
+  });
+
+  await assert.rejects(
+    () =>
+      VERB_REGISTRY.download.execute(
+        page,
+        {
+          selector: "button.export",
+          path: "out.bin",
+          timeout: 2000,
+          signed_url: { enabled: true, hosts: ["127.0.0.1:9"] },
+        },
+        { index: 0 },
+      ),
+    /private\/loopback IP/,
+  );
+
+  assert.equal(fetched, false, "guard must reject before any network fetch");
+  assert.equal(existsSync(path.join(dir, "out.bin")), false);
+  const failed = cap.frames.find((f) => f.type === "slice.download_failed");
+  assert.ok(failed);
+  assert.match(failed.reason, /private\/loopback IP/);
+});
+
+// --- 7. Size cap ------------------------------------------------------------
+
+test("download rejects a signed URL whose Content-Length exceeds the cap", async (t) => {
+  const dir = await withArtifactsDir(t);
+  allowPrivateDownloadIp(t);
+  withEnv(t, "WB_MAX_DOWNLOAD_BYTES", "16");
+  const cap = captureSendFrames();
+  t.after(cap.dispose);
+
+  const big = Buffer.alloc(1024, 0x41);
+  const { port, base } = await startServer(t, (req, res) => {
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/octet-stream");
+    res.setHeader("content-length", String(big.length));
+    res.end(big);
+  });
+
+  const signedUrl = `${base}/big.bin`;
+  const { page } = makePage({
+    waitForEventImpl: () => new Promise(() => {}),
+    evaluateImpl: signedEvaluateImpl({
+      api_url: "https://app/d",
+      urls: [{ field: "download_url", url: signedUrl }],
+    }),
+  });
+
+  await assert.rejects(
+    () =>
+      VERB_REGISTRY.download.execute(
+        page,
+        {
+          selector: "button.export",
+          path: "big.bin",
+          timeout: 2000,
+          signed_url: { enabled: true, hosts: [`127.0.0.1:${port}`] },
+        },
+        { index: 0 },
+      ),
+    /exceeds size cap/,
+  );
+
+  assert.equal(existsSync(path.join(dir, "big.bin")), false, "oversized file must not be written");
+  const failed = cap.frames.find((f) => f.type === "slice.download_failed");
+  assert.ok(failed);
+  assert.match(failed.reason, /Content-Length .* cap/);
+});
+
+test("download aborts a signed URL whose streamed body exceeds the cap (no Content-Length)", async (t) => {
+  const dir = await withArtifactsDir(t);
+  allowPrivateDownloadIp(t);
+  withEnv(t, "WB_MAX_DOWNLOAD_BYTES", "16");
+  const cap = captureSendFrames();
+  t.after(cap.dispose);
+
+  // Chunked response (no Content-Length) that dribbles far more than the cap,
+  // so the Content-Length pre-check can't catch it — only the streaming guard.
+  const { base, port } = await startServer(t, (req, res) => {
+    res.statusCode = 200;
+    res.setHeader("content-type", "application/octet-stream");
+    const chunk = Buffer.alloc(64, 0x42);
+    let n = 0;
+    const iv = setInterval(() => {
+      if (n++ >= 8) {
+        clearInterval(iv);
+        try {
+          res.end();
+        } catch {}
+        return;
+      }
+      try {
+        res.write(chunk);
+      } catch {
+        clearInterval(iv);
+      }
+    }, 5);
+  });
+
+  const signedUrl = `${base}/stream.bin`;
+  const { page } = makePage({
+    waitForEventImpl: () => new Promise(() => {}),
+    evaluateImpl: signedEvaluateImpl({
+      api_url: "https://app/d",
+      urls: [{ field: "download_url", url: signedUrl }],
+    }),
+  });
+
+  await assert.rejects(
+    () =>
+      VERB_REGISTRY.download.execute(
+        page,
+        {
+          selector: "button.export",
+          path: "stream.bin",
+          timeout: 2000,
+          signed_url: { enabled: true, hosts: [`127.0.0.1:${port}`] },
+        },
+        { index: 0 },
+      ),
+    /size cap/,
+  );
+
+  assert.equal(
+    existsSync(path.join(dir, "stream.bin")),
+    false,
+    "partial over-cap file must be removed",
+  );
+  const failed = cap.frames.find((f) => f.type === "slice.download_failed");
+  assert.ok(failed);
+  assert.match(failed.reason, /mid-stream/);
+});
+
+// --- 8. Forced-mode requires a host match (no bypass) ----------------------
+
+test("download (forced signed_url) without a host match captures nothing", async (t) => {
+  const dir = await withArtifactsDir(t);
+  const cap = captureSendFrames();
+  t.after(cap.dispose);
+
+  // Forced mode + json_fields, but the URL host is neither signed nor in any
+  // allowlist. The picker must NOT select it, so the verb times out with no
+  // capture (and never reaches the server-side fetch).
+  let fetched = false;
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetched = true;
+    throw new Error("should not fetch — no host match");
+  };
+  t.after(() => {
+    globalThis.fetch = prevFetch;
+  });
+
+  const { page } = makePage({
+    waitForEventImpl: async () => {
+      const err = new Error("timeout");
+      err.name = "TimeoutError";
+      throw err;
+    },
+    evaluateImpl: signedEvaluateImpl({
+      api_url: "https://app.example.com/d",
+      urls: [{ field: "download_url", url: "https://app.example.com/x.csv?tok=9" }],
+    }),
+  });
+
+  await assert.rejects(
+    () =>
+      VERB_REGISTRY.download.execute(
+        page,
+        {
+          selector: "button.export",
+          path: "x.csv",
+          timeout: 150,
+          signed_url: { enabled: true, json_fields: ["download_url"] },
+        },
+        { index: 0 },
+      ),
+    /no file captured/,
+  );
+
+  assert.equal(fetched, false, "no server-side fetch without a host match");
+  assert.equal(existsSync(path.join(dir, "x.csv")), false);
 });
 
 test("download with signed_url:false does not install the signed hook", async (t) => {

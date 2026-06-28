@@ -171,13 +171,13 @@ endpoint at session close. Recording is **off by default** — set
 | `WB_RECORDING_MASK_ALL_INPUTS`     | `1`        | rrweb `maskAllInputs`. Set `0` to record input *values* (off by default for safety). |
 | `WB_RECORDING_MASK_TEXT_SELECTOR`  | *(unset)*  | CSS selector whose **text content** rrweb masks (e.g. `.ssn, .acct-balance`). |
 | `WB_RECORDING_BLOCK_SELECTOR`      | *(unset)*  | CSS selector rrweb records as an inert placeholder (contents never captured). |
-| `WB_RECORDING_IGNORE_SELECTOR`     | *(unset)*  | CSS selector whose input events rrweb drops entirely. |
+| `WB_RECORDING_IGNORE_SELECTOR`     | *(unset)*  | CSS selector for elements to exclude from the recording. **In this build it is applied as a block selector** (unioned with `WB_RECORDING_BLOCK_SELECTOR`): the matching element is recorded as an inert placeholder and its subtree/inputs are never captured. The vendored rrweb bundle does not support rrweb's `ignoreSelector` (which only drops input *events*), so we map this knob onto the supported, stronger `blockSelector` to honor the "drop this field" intent. |
 
 Artifacts are two parallel POSTs per session, `kind ∈ {rrweb, video}`:
 
 - **rrweb** — gzipped JSON (`application/json+gzip`) — `{ run_id, session, event_count, events: [...] }`. DOM mutations + input events captured from every page.
 
-  **PII scope — read this.** `maskAllInputs` (on by default) only redacts the *values* a user types into form fields. It does **not** mask field labels, placeholders, `aria-label`s, `<option>` text, or any other rendered text, and it does not alter the recorded DOM structure. A displayed account number, balance, or name that is page text — not an input value — is captured verbatim. For those, point rrweb at the sensitive nodes with `WB_RECORDING_MASK_TEXT_SELECTOR` (mask the text) or `WB_RECORDING_BLOCK_SELECTOR` (omit the subtree). When in doubt, block the region.
+  **PII scope — read this.** `maskAllInputs` (on by default) only redacts the *values* a user types into form fields. It does **not** mask field labels, placeholders, `aria-label`s, `<option>` text, or any other rendered text, and it does not alter the recorded DOM structure. A displayed account number, balance, or name that is page text — not an input value — is captured verbatim. For those, point rrweb at the sensitive nodes with `WB_RECORDING_MASK_TEXT_SELECTOR` (mask the text) or `WB_RECORDING_BLOCK_SELECTOR` (omit the subtree). `WB_RECORDING_IGNORE_SELECTOR` is treated as an alias for `WB_RECORDING_BLOCK_SELECTOR` in this build (the vendored rrweb bundle has no `ignoreSelector` support), so a field named there is excluded from the recording entirely rather than merely having its input events dropped. When in doubt, block the region.
 - **video** — VP9 WebM (`video/webm`) — encoded from JPEG screencast frames via `ffmpeg`. Requires `ffmpeg` on `$PATH` (droplet install: `apt-get install -y ffmpeg`). If `ffmpeg` is missing the video kind silently disables and rrweb continues alone.
 
 Each POST carries headers `Authorization: Bearer <secret>`,
