@@ -146,8 +146,10 @@ async function ensureSession(name, { profile, restoreSession } = {}) {
       };
 
       // Install the always-on download listener now, before any slice
-      // runs, so a download fired by the very first verb is captured.
-      installDownloadCapture(context, () => info.currentVerb);
+      // runs, so a download fired by the very first verb is captured. The
+      // returned handle exposes `drainSignedDiagnostics()` — called at clean
+      // slice end to flag signed-URL exports that fired no download event.
+      info.passiveCapture = installDownloadCapture(context, () => info.currentVerb);
 
       send({
         type: "slice.session_started",
@@ -336,9 +338,17 @@ async function handleSlice(msg) {
         return;
       }
     }
-    // Slice ended cleanly — clear the listener's "currently running verb"
-    // pointer so a stray late-arriving download doesn't get stamped with
-    // the last verb's name.
+    // Slice ended cleanly — surface any signed-URL export that fired no
+    // download event (uncaptured by the explicit `download:` verb) as a
+    // diagnostic before we clear the verb pointer, so the frame can still
+    // name the last verb that ran. Best-effort: never fails a clean slice.
+    try {
+      await session.passiveCapture?.drainSignedDiagnostics();
+    } catch (e) {
+      log(`[download-capture] signed diagnostics drain: ${e.message}`);
+    }
+    // Clear the listener's "currently running verb" pointer so a stray
+    // late-arriving download doesn't get stamped with the last verb's name.
     session.currentVerb = null;
     send({ type: "slice.complete" });
   } catch (e) {

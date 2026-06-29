@@ -1,8 +1,14 @@
 # Feature Requests
 
+_No open requests._
+
+---
+
+# Shipped
+
 ## Signed URL export capture
 
-**Status:** SHIPPED 2026-06-27. Requested from the Pilot financial statements runbook on 2026-05-07.
+**Status:** SHIPPED 2026-06-27 (v0.14.0: 282a9a2; SSRF hardening 345c779). Requested from the Pilot financial statements runbook on 2026-05-07.
 
 Implemented as a third capture racer in the `download:` verb (`lib/signed-url-capture.js` + `verbs/download.js`):
 
@@ -13,7 +19,7 @@ Implemented as a third capture racer in the `download:` verb (`lib/signed-url-ca
 - `slice.artifact_saved` carries `capture: "signed_url"`, `api_url`, `field`, `content_type`, `content_disposition`. Failures emit `slice.download_failed` with redacted diagnostics; a 403 sets `expired: true`.
 - Tests: pure helpers in `test/signed-url-capture.test.js`; verb-level capture/redaction/expiry/disable in `test/download-verb.test.js`.
 
-Acceptance criteria met. Remaining nicety (not yet done): wiring `slice.download_skipped`-style diagnostics for the passive (non-`download:`-verb) capture path; the verb path is complete.
+Acceptance criteria met. Passive-path diagnostics now wired too: the signed-URL fetch/XHR hook is installed context-wide at session start (`lib/download-capture.js`), and at clean slice end any recognized signed-host export URL that fired no `download` event and wasn't claimed by an explicit `download:` verb is surfaced as `slice.download_skipped { reason: "signed_url_not_captured", capture: "signed_url" }` with a redacted URL and a hint to use the verb. Diagnostics only — passive mode never auto-downloads (that stays the verb's job, with its SSRF guards). Covered by `test/download-capture.test.js`.
 
 ### Original request (for history)
 

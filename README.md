@@ -365,6 +365,17 @@ Playwright/blob download is unaffected. Tune or disable it per verb:
   `expired: true` and `http_status: 403` so the operator knows to shorten the
   click→fetch gap.
 
+**Passive diagnostics (no `download:` verb):** the same signed-URL fetch/XHR
+hook is also installed context-wide, so even a runbook that never uses the
+`download:` verb gets told when an export slips through. If a recognized
+signed-host export URL appears in a same-origin JSON response but fires no
+`download` event (and isn't claimed by a `download:` verb), the runtime emits
+`slice.download_skipped` with `reason: "signed_url_not_captured"`, a redacted
+`signed_url`, the `api_url`/`field`, and a hint to add a `download:` verb with
+`signed_url`. This path is **diagnostics only** — it never fetches the URL
+itself; server-side capture (with its SSRF guards) stays the `download:` verb's
+job.
+
 ## Protocol
 
 Line-framed JSON, one message per line, on stdin/stdout. `stderr` is treated as
