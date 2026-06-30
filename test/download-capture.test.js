@@ -317,6 +317,140 @@ test("installDownloadCapture saves matching downloads and emits artifact_saved",
   }
 });
 
+// --- signed-URL passive diagnostics ----------------------------------------
+
+// Build a context double whose pages return a scripted signed-candidate
+// buffer from the SIGNED_POLL_SCRIPT evaluate, and record installed scripts.
+function fakeSignedContext({ candidates = [], pageUrl = "https://app.example.com/reports" } = {}) {
+  const initScripts = [];
+  const evaluated = [];
+  const page = {
+    url: () => pageUrl,
+    evaluate: async (script) => {
+      evaluated.push(script);
+      // Install evaluates SIGNED_PAGE_HOOK (idempotent install) — not a poll.
+      if (String(script).includes("__wbSignedInstalled")) return undefined;
+      // SIGNED_POLL_SCRIPT: read-and-clear — return the buffer once, then empty.
+      const out = page.__drained ? [] : candidates;
+      page.__drained = true;
+      return out;
+    },
+  };
+  return {
+    initScripts,
+    evaluated,
+    page,
+    on() {},
+    addInitScript(s) {
+      initScripts.push(s);
+      return Promise.resolve();
+    },
+    pages() {
+      return [page];
+    },
+  };
+}
+
+function captureFrames() {
+  const original = process.stdout.write.bind(process.stdout);
+  const frames = [];
+  process.stdout.write = (chunk, ...rest) => {
+    try {
+      const line = String(chunk).trim();
+      if (line.startsWith("{")) frames.push(JSON.parse(line));
+    } catch {}
+    return original(chunk, ...rest);
+  };
+  return { frames, restore: () => (process.stdout.write = original) };
+}
+
+test("drainSignedDiagnostics flags an uncaptured signed-host export URL", async () => {
+  const { installDownloadCapture } = await import("../lib/download-capture.js");
+  const { frames, restore } = captureFrames();
+  const dir = tmp();
+  const prevDir = process.env.WB_ARTIFACTS_DIR;
+  process.env.WB_ARTIFACTS_DIR = dir;
+
+  const ctx = fakeSignedContext({
+    candidates: [
+      {
+        api_url: "https://app.example.com/reports/42/download",
+        urls: [
+          {
+            field: "data.download_url",
+            url: "https://exports.s3.amazonaws.com/r/42.xlsx?X-Amz-Signature=secret123",
+          },
+        ],
+      },
+    ],
+  });
+
+  try {
+    const handle = installDownloadCapture(ctx, () => ({ index: 5, name: "click" }));
+    // The hook should be installed context-wide for future documents.
+    assert.ok(ctx.initScripts.length >= 1, "expected addInitScript install");
+
+    await handle.drainSignedDiagnostics();
+
+    const diag = frames.find(
+      (f) => f.type === "slice.download_skipped" && f.reason === "signed_url_not_captured",
+    );
+    assert.ok(diag, "expected signed_url_not_captured diagnostic");
+    assert.equal(diag.capture, "signed_url");
+    assert.equal(diag.host, "exports.s3.amazonaws.com");
+    assert.equal(diag.api_url, "https://app.example.com/reports/42/download");
+    assert.equal(diag.field, "data.download_url");
+    assert.equal(diag.verb_index, 5);
+    assert.equal(diag.verb_name, "click");
+    // Signed query credentials must never cross stdio.
+    assert.equal(diag.signed_url, "https://exports.s3.amazonaws.com/r/42.xlsx?<redacted>");
+    assert.ok(!JSON.stringify(diag).includes("secret123"), "must not leak signed params");
+
+    // Second drain is deduped (read-and-clear + per-session seen Set).
+    const before = frames.filter((f) => f.reason === "signed_url_not_captured").length;
+    await handle.drainSignedDiagnostics();
+    const after = frames.filter((f) => f.reason === "signed_url_not_captured").length;
+    assert.equal(after, before, "same export must not be reported twice");
+  } finally {
+    restore();
+    if (prevDir === undefined) delete process.env.WB_ARTIFACTS_DIR;
+    else process.env.WB_ARTIFACTS_DIR = prevDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("drainSignedDiagnostics ignores non-signed (ordinary app) URLs", async () => {
+  const { installDownloadCapture } = await import("../lib/download-capture.js");
+  const { frames, restore } = captureFrames();
+  const dir = tmp();
+  const prevDir = process.env.WB_ARTIFACTS_DIR;
+  process.env.WB_ARTIFACTS_DIR = dir;
+
+  const ctx = fakeSignedContext({
+    candidates: [
+      {
+        api_url: "https://app.example.com/api/me",
+        urls: [{ field: "avatar_url", url: "https://app.example.com/img/a.png" }],
+      },
+    ],
+  });
+
+  try {
+    const handle = installDownloadCapture(ctx, () => ({ index: 0, name: "goto" }));
+    await handle.drainSignedDiagnostics();
+    assert.equal(
+      frames.some((f) => f.reason === "signed_url_not_captured"),
+      false,
+      "ordinary same-origin URL must not be flagged",
+    );
+  } finally {
+    restore();
+    if (prevDir === undefined) delete process.env.WB_ARTIFACTS_DIR;
+    else process.env.WB_ARTIFACTS_DIR = prevDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("installDownloadCapture is a no-op when WB_ARTIFACTS_DIR is unset", async () => {
   const { installDownloadCapture } = await import(
     "../lib/download-capture.js"
